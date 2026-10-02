@@ -1,0 +1,43 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+        maven { name = 'MinecraftForge'; url = 'https://maven.minecraftforge.net/' }
+        maven { name = 'NeoForged';      url = 'https://maven.neoforged.net/releases' }
+        maven { name = 'FabricMC';       url = 'https://maven.fabricmc.net/' }
+        maven { name = 'ParchmentMC';    url = 'https://maven.parchmentmc.org' }
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'octant'
+
+include 'common'
+include 'pipeline'
+include 'capture-core'
+
+def platformsEnabled = providers.gradleProperty('octant.platforms').getOrElse('false') == 'true'
+
+if (platformsEnabled) {
+    [
+            [':forge:mc1201',    'forge/1.20.1'],
+            [':neoforge:mc1201', 'neoforge/1.20.1'],
+            [':neoforge:mc1211', 'neoforge/1.21.1'],
+            [':fabric:mc1201',   'fabric/1.20.1'],
+            [':fabric:mc1211',   'fabric/1.21.1'],
+    ].each { entry ->
+        include entry[0]
+        project(entry[0]).projectDir = new File(rootDir, entry[1])
+    }
+}
+
+def forge1211Enabled =
+        providers.gradleProperty('octant.platforms.forge1211').getOrElse('false') == 'true'
+
+if (platformsEnabled && forge1211Enabled) {
+    include ':forge:mc1211'
+    project(':forge:mc1211').projectDir = new File(rootDir, 'forge/1.21.1')
+}

@@ -1,0 +1,246 @@
+plugins {
+    id 'java-library'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+version = '0.1.0'
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+
+    runs {
+        client {
+            workingDirectory project.file('build/octant-run/client')
+            property 'octant.run', 'client'
+        }
+        server {
+            workingDirectory project.file('build/octant-run/server')
+            property 'octant.run', 'server'
+            args 'nogui'
+        }
+    }
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.4.23'
+
+    implementation project(':capture-core')
+    implementation project(':common')
+    implementation project(':pipeline')
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    systemProperty 'java.awt.headless', 'true'
+    doFirst {
+        systemProperty 'octant.modJar',
+                tasks.named('jar').get().archiveFile.get().asFile.absolutePath
+    }
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+def siblingJars = configurations.create('siblingModContents') {
+    canBeConsumed = false
+    canBeResolved = true
+    transitive = false
+}
+dependencies {
+    siblingModContents project(':capture-core')
+siblingModContents project(':common')
+    siblingModContents project(':pipeline')
+}
+
+def siblingRuntimeArtifacts = configurations.create('siblingRuntimeContents') {
+    canBeConsumed = false
+    canBeResolved = true
+    transitive = true
+}
+dependencies {
+    siblingRuntimeContents project(':capture-core')
+siblingRuntimeContents project(':common')
+    siblingRuntimeContents project(':pipeline')
+}
+
+def slimmedLibraries = ['pdfbox', 'fontbox', 'jfreechart', 'jcommon']
+
+def bundledJarFiles = provider {
+    siblingRuntimeArtifacts.resolve()
+            .findAll { it.name.endsWith('.jar') }
+            .findAll { f ->
+                def n = f.name
+                !(n.startsWith('common-') || n.startsWith('pipeline-'))
+            }
+            .findAll { f ->
+                def nm = f.name
+                !nm.startsWith('commons-logging-')
+            }
+            .findAll { f ->
+                def slim = f.name
+                !slimmedLibraries.any { p -> slim.startsWith(p) }
+            }
+            .findAll { f ->
+                def n = f.name
+                !(n.startsWith('forge-') || n.startsWith('fmlloader-') || n.startsWith('fmlcore-')
+                        || n.startsWith('javafmllanguage-') || n.startsWith('mclanguage-')
+                        || n.startsWith('client-') || n.startsWith('server-'))
+            }
+            .unique { it.name }
+            .sort { it.name }
+}
+
+def bundlesCommonsLogging = false
+
+tasks.named('jar', Jar) {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    dependsOn ':capture-core:jar', ':common:jar', ':pipeline:jar'
+    archiveBaseName = 'octant'
+    manifest {
+        attributes(
+                'Implementation-Title'  : 'Octant',
+                'Implementation-Version': project.version.toString(),
+                'FMLModType'            : 'MOD',
+                'Automatic-Module-Name' : 'com.octant.forge.v1_20_1'
+        )
+    }
+    from({ siblingJars.resolve().collect { zipTree(it) } }) {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+        exclude 'module-info.class'
+        exclude '**/*.jar'
+    }
+
+    from({ bundledJarFiles.get().collect { zipTree(it) } }) {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+        exclude 'module-info.class'
+        exclude '**/*.jar'
+    }
+}
+
+tasks.matching { it.name == 'reobfJar' }.configureEach {
+    dependsOn tasks.named('jar')
+}
+
+tasks.register('verifyModJar') {
+    group = 'verification'
+    description = '断言自足 mod jar 真的包含 mods.toml / 主类 / 引擎类 / 依赖类 / 字体资产'
+    dependsOn 'reobfJar'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        def overrideJar = project.findProperty('octant.verifyJar')
+        def jarFile = overrideJar ? file(overrideJar) : tasks.named('jar').get().archiveFile.get().asFile
+        if (!jarFile.isFile()) {
+            throw new GradleException("无法判定：jar 产物不存在（${jarFile}）")
+        }
+        def zip = new java.util.zip.ZipFile(jarFile)
+        def entries
+        def tomlText
+        try {
+            entries = zip.entries().collect { it.name }
+            tomlText = zip.getInputStream(zip.getEntry('META-INF/mods.toml')).getText('UTF-8')
+        } finally {
+            zip.close()
+        }
+        def set = entries as Set
+
+        def required = [
+                'META-INF/mods.toml'                                              : 'FML 载入本 jar 的前提',
+                'com/octant/forge/v1_20_1/OctantMod.class'                   : '@Mod 主类',
+                'com/octant/common/model/CaptureEvent.class'                    : ':common 的契约类型',
+                'com/octant/common/privacy/adapter/ConsentGate.class'           : ':common 的同意门',
+                'com/octant/pipeline/export/ExportPipeline.class'               : ':pipeline 导出管线',
+                'com/octant/pipeline/analysis/AnalysisReport.class'             : ':pipeline 分析',
+                'com/octant/pipeline/report/html/HtmlReport.class'              : '报告渲染（产品路径：HtmlReport）',
+                'com/octant/pipeline/report/html/ContentSections.class'         : '正文四节渲染（产品路径）',
+                'content/tips.tsv'                                                 : '提示库（渲染时读取）',
+                'com/octant/pipeline/report/font/NotoSansSC-Regular-subset.ttf' : '报告字体（子集）',
+                'com/octant/pipeline/report/font/NotoSansSC-Report-wide.ttf'    : '报告字体（宽字集）',
+                'com/octant/pipeline/report/font/OFL-1.1-LICENSE.txt'           : '字体许可文本（随包附送）',
+                'octant.png'                                                      : '模组列表图标（mods.toml logoFile）',
+        ]
+        def missing = required.findAll { name, why -> !set.contains(name) }
+        if (!missing.isEmpty()) {
+            throw new GradleException('守卫失败：自足 mod jar 缺少必需条目：\n'
+                    + missing.collect { "  ${it.key}  —— ${it.value}" }.join('\n')
+                    + '\n（上一阶段的失败模式正是"只有 MANIFEST.MF + 一个 class"，此处必须逐条拦住）')
+        }
+
+        def slimViolations = [
+                'org/apache/pdfbox/' : entries.findAll { it.startsWith('org/apache/pdfbox/') },
+                'org/apache/fontbox/': entries.findAll { it.startsWith('org/apache/fontbox/') },
+                'org/jfree/'         : entries.findAll { it.startsWith('org/jfree/') },
+        ].findAll { k, v -> !v.isEmpty() }
+        if (!slimViolations.isEmpty()) {
+            throw new GradleException('瘦身守卫失败：产物里出现了产品路径不用的库：\n'
+                    + slimViolations.collect { k, v -> "  ${k}  ${v.size()} 条（例：${v.take(2)}）" }.join('\n')
+                    + '\n它们的唯一调用者是 ModSelfCheck 的 PDF 自检（已改为验 HtmlReport），\n'
+                    + '产品导出走 HtmlReport 且零依赖 ⇒ 打进 jar 只是白占约 46% 体积。\n'
+                    + '若确要恢复 PDF 随包分发：把 build.gradle 的 slimmedLibraries 相应条目去掉，\n'
+                    + '并把 ModSelfCheck 的 ④ 改回 PdfReport —— 两处必须同时改，本断言会拦住只改一处。')
+        }
+
+        def mcClasses = entries.findAll { it.startsWith('net/minecraft/') }
+        if (!mcClasses.isEmpty()) {
+            throw new GradleException('守卫失败：平台层产物里出现了 net/minecraft 的类'
+                    + '（共 ' + mcClasses.size() + ' 条，例：' + mcClasses.take(3) + '）')
+        }
+
+        def commonsLoggingEntries = entries.findAll { it.startsWith('org/apache/commons/logging/') }
+        if (!bundlesCommonsLogging && !commonsLoggingEntries.isEmpty()) {
+            throw new GradleException('守卫失败：产物里出现了 org.apache.commons.logging 的类'
+                    + '（共 ' + commonsLoggingEntries.size() + ' 条）。\n'
+                    + '这会与启动器提供的模块 commons.logging 冲突，游戏在模块层解析阶段直接崩：\n'
+                    + '  ResolutionException: Module octant contains package org.apache.commons.logging,\n'
+                    + '  module commons.logging exports package org.apache.commons.logging to octant\n'
+                    + 'PDFBox 在运行时从模块路径取 LogFactory，不需要我们内置一份。')
+        }
+        if (bundlesCommonsLogging) {
+            logger.lifecycle('  ⚠️ bundlesCommonsLogging=true —— 已明知会与模块 commons.logging 冲突，仅用于反向对照')
+        }
+
+        if (!tomlText.contains('modId = "octant"')) {
+            throw new GradleException('守卫失败：mods.toml 的 modId 不是字面量 "octant"'
+                    + '（写成占位符会被 FML 原样当成标识）')
+        }
+        def depBlocks = (tomlText =~ /(?s)\[\[dependencies\.octant\]\](.*?)(?=\n\[|\z)/)
+                .collect { it[1] }
+        if (depBlocks.isEmpty()) {
+            throw new GradleException('守卫失败：mods.toml 没有声明任何 [[dependencies.octant]]')
+        }
+        def noMandatory = depBlocks.findAll { !(it =~ /(?m)^\s*mandatory\s*=/) }
+        if (!noMandatory.isEmpty()) {
+            throw new GradleException('守卫失败：有 ' + noMandatory.size() + ' 个依赖段缺少 mandatory 字段。\n'
+                    + '实测后果：FML 报 InvalidModFileException: Missing required field mandatory in dependency，'
+                    + '**整个 jar 被当成非法模组文件丢弃**（游戏照常启动，只有一行 ERROR）。')
+        }
+
+        logger.lifecycle(String.format('verifyModJar: 产物 %s（%,d B = %.2f MB），%d 个条目',
+                jarFile.name, jarFile.length(), jarFile.length() / 1024.0 / 1024.0, entries.size()))
+        logger.lifecycle('  —— 必需条目（逐条实测存在）——')
+        required.each { name, why -> logger.lifecycle("    OK  ${name}   [${why}]") }
+        logger.lifecycle('  —— 体积构成（按顶层包聚合，降序）——')
+        def byTop = entries.groupBy { it.contains('/') ? it.substring(0, it.indexOf('/')) : '(根)' }
+        byTop.sort { -it.value.size() }.take(14).each { k, v ->
+            logger.lifecycle(String.format('    %-26s %6d 条', k, v.size()))
+        }
+        logger.lifecycle('  —— 打包来源（第三方，逐条实测）——')
+        bundledJarFiles.get().each { f ->
+            logger.lifecycle(String.format('    + %-52s %8.1f KB', f.name, f.length() / 1024.0))
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn 'verifyModJar'
+}

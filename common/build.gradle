@@ -1,0 +1,34 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+def javaSources = fileTree('src') {
+    include '**/*.java'
+    include '**/*.gradle'
+}
+
+tasks.register('assertNoMinecraftRefs') {
+    group = 'verification'
+    description = '断言 common 源码不含任何 net.minecraft 引用（离线无头单测的前提）'
+    inputs.files(javaSources)
+    outputs.upToDateWhen { false }
+    doLast {
+        def hits = []
+        javaSources.each { f ->
+            f.eachLine { line, no ->
+                if (line.contains('net.minecraft')) { hits << "${f.name}:${no}: ${line.trim()}" }
+            }
+        }
+        if (!hits.isEmpty()) {
+            throw new GradleException("common 模块禁止引用 net.minecraft：\n" + hits.join('\n'))
+        }
+        logger.lifecycle('assertNoMinecraftRefs: PASS — common 源码无 net.minecraft 引用')
+    }
+}
+
+tasks.named('check') { dependsOn 'assertNoMinecraftRefs' }

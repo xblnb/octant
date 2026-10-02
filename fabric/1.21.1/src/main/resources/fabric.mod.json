@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "octant",
+  "version": "0.1.0",
+  "name": "Octant（卦限）",
+  "description": "面向整合包开发者的本地玩家行为洞察工具。默认不采集（同意文件不存在即视为不采集，fail-closed）；采集与导出只由玩家在游戏内主动执行命令触发，随时可撤回；全部分析在本机完成，运行期不发起任何网络请求。",
+  "authors": [
+    "Octant contributors"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "icon": "octant.png",
+  "entrypoints": {
+    "main": [
+      "com.octant.fabric.v1_21_1.OctantFabricMod"
+    ],
+    "server": [
+      "com.octant.fabric.v1_21_1.OctantFabricMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~1.21.1",
+    "java": ">=21"
+  }
+}

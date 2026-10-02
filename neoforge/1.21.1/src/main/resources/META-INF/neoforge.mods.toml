@@ -1,0 +1,32 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+displayTest = "IGNORE_ALL_VERSION"
+
+[[mods]]
+modId = "octant"
+version = "0.1.0"
+displayName = "Octant（卦限）"
+logoFile = "octant.png"
+description = '''
+Octant（卦限）—— 面向整合包开发者的本地玩家行为洞察工具。
+
+默认**不采集**：同意文件不存在或读不出来时一律按"不采集"处理（fail-closed）。
+采集与导出都只由玩家**在游戏内主动执行命令**触发，且随时可用命令撤回。
+所有分析在本机完成，产物只写在本机磁盘，运行期不发起任何网络请求。
+'''
+
+[[dependencies.octant]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.octant]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.21.2)"
+ordering = "NONE"
+side = "BOTH"

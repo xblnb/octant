@@ -1,0 +1,83 @@
+plugins {
+    id 'java-library'
+    id 'fabric-loom' version '1.7.4'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+def siblingBundle = configurations.create('siblingContents') {
+    transitive = false
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:1.21.1"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:0.19.5"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:0.116.17+1.21.1"
+
+    implementation project(':capture-core')
+    implementation project(':common')
+    implementation project(':pipeline')
+
+    siblingContents project(':capture-core')
+    siblingContents project(':common')
+    siblingContents project(':pipeline')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}
+
+jar {
+    dependsOn ':capture-core:jar', ':common:jar', ':pipeline:jar'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from({ configurations.siblingContents.resolve().collect { zipTree(it) } }) {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+        exclude 'module-info.class'
+        exclude '**/*.jar'
+    }
+}
+
+base {
+    archivesName = 'octant'
+}
+
+tasks.register('verifyModJar') {
+    group = 'verification'
+    description = '逐条断言 Fabric 1.21.1 产物真的包含必需项、且不含禁止项'
+    dependsOn 'remapJar'
+    outputs.upToDateWhen { false }
+    doLast {
+        def f = tasks.named('remapJar').get().archiveFile.get().asFile
+        if (!f.isFile()) { throw new GradleException('产物不存在：' + f) }
+        def zip = new java.util.zip.ZipFile(f)
+        def names = zip.entries().collect { it.name } as Set
+        zip.close()
+        def required = ['fabric.mod.json', 'octant.png', 'pack.mcmeta', 'content/tips.tsv',
+                        'com/octant/fabric/v1_21_1/OctantFabricMod.class',
+                        'com/octant/fabric/v1_21_1/OctantFabricHost.class',
+                        'com/octant/capture/CaptureRuntime.class',
+                        'com/octant/capture/ModExportRunner.class']
+        def missing = required.findAll { !names.contains(it) }
+        if (!missing.isEmpty()) {
+            throw new GradleException('产物缺少必需条目：' + missing.join(', '))
+        }
+        def fonts = names.findAll { it.endsWith('.ttf') }
+        if (fonts.isEmpty()) { throw new GradleException('产物里没有报告字体资产（.ttf）') }
+        def banned = names.findAll {
+            it.startsWith('org/apache/pdfbox/') || it.startsWith('org/apache/fontbox/')
+                    || it.startsWith('org/jfree/')
+        }
+        if (!banned.isEmpty()) {
+            throw new GradleException('产物里出现 PDFBox/JFreeChart 的类（' + banned.size() + ' 条）')
+        }
+        logger.lifecycle('verifyModJar: PASS — ' + f.name + '（'
+                + String.format('%.2f', f.length() / 1048576.0) + ' MB），'
+                + names.size() + ' 个条目，' + fonts.size() + ' 个字体资产')
+    }
+}

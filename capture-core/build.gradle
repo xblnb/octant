@@ -1,0 +1,44 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    api project(':common')
+    api project(':pipeline')
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+def neutralSources = fileTree('src') {
+    include '**/*.java'
+    include '**/*.gradle'
+}
+
+tasks.register('assertNoMinecraftRefs') {
+    group = 'verification'
+    description = '断言 capture-core 源码不含任何 net.minecraft 引用（它是所有平台共享的前提）'
+    inputs.files(neutralSources)
+    outputs.upToDateWhen { false }
+    doLast {
+        def hits = []
+        neutralSources.each { f ->
+            f.eachLine { line, no ->
+                if (line.contains('net.minecraft')) { hits << "${f.name}:${no}: ${line.trim()}" }
+            }
+        }
+        ['net.minecraftforge', 'net.neoforged', 'net.fabricmc'].each { p ->
+            neutralSources.each { f ->
+                f.eachLine { line, no ->
+                    if (line.contains(p)) { hits << "${f.name}:${no}: [平台专属] ${line.trim()}" }
+                }
+            }
+        }
+        if (!hits.isEmpty()) {
+            throw new GradleException('capture-core 必须保持平台无关，命中：\n' + hits.join('\n'))
+        }
+        logger.lifecycle('assertNoMinecraftRefs: PASS — capture-core 无任何平台专属引用')
+    }
+}
+
+tasks.named('check') { dependsOn 'assertNoMinecraftRefs' }

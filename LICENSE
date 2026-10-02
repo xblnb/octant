@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 Octant contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+────────────────────────────────────────────────────────────────────────────
+范围说明（不是许可条款的组成部分，但上架页需要它准确）：
+
+1. 本许可覆盖本仓库**自有代码与文档**（模组、管线、报告生成器与设计文档）。
+2. 它**不覆盖** Minecraft 本身及其官方资源 —— 那些受 Mojang 的最终用户许可协议
+   与使用准则约束；本模组仅在运行时依赖游戏，**不随附任何 Mojang 资源**。
+3. 它**不自动覆盖**第三方依赖的许可：管线侧使用 Apache PDFBox（Apache-2.0）与
+   JFreeChart（LGPL-2.1）；报告产物内嵌的字体采用 SIL Open Font License 1.1
+   （许可全文随模块资源分发）。上架页的依赖声明必须与上述一致，
+   **不得写成“无第三方依赖”**。
+4. 报告是**在本地生成的单文件产物**：模组不执行上传；报告仅由玩家自愿导出、
+   并由玩家自行决定是否分享。
+
+（版权持有者一行当前写为 “Octant contributors”；若你要换成个人名或组织名，
+改这一行即可，无需改动其它任何内容。）

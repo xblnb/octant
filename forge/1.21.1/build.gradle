@@ -1,0 +1,92 @@
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'net.minecraftforge.gradle' version '[7.0.3,8)'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.21.1'
+}
+
+repositories {
+    minecraft.mavenizer(it)
+    maven fg.forgeMaven
+    maven fg.minecraftLibsMaven
+    mavenCentral()
+}
+
+def siblingBundle = configurations.create('siblingContents') {
+    transitive = false
+}
+
+dependencies {
+    implementation minecraft.dependency('net.minecraftforge:forge:1.21.1-52.1.16')
+
+    implementation project(':capture-core')
+    implementation project(':common')
+    implementation project(':pipeline')
+
+    siblingContents project(':capture-core')
+    siblingContents project(':common')
+    siblingContents project(':pipeline')
+}
+
+base {
+    archivesName = 'octant'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}
+
+jar {
+    dependsOn ':capture-core:jar', ':common:jar', ':pipeline:jar'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from({ configurations.siblingContents.resolve().collect { zipTree(it) } }) {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+        exclude 'module-info.class'
+        exclude '**/*.jar'
+    }
+}
+
+tasks.register('verifyModJar') {
+    group = 'verification'
+    description = '逐条断言 Forge 1.21.1 产物真的包含必需项、且不含禁止项'
+    dependsOn 'jar'
+    outputs.upToDateWhen { false }
+    doLast {
+        def f = tasks.named('jar').get().archiveFile.get().asFile
+        if (!f.isFile()) { throw new GradleException('产物不存在：' + f) }
+        def zip = new java.util.zip.ZipFile(f)
+        def names = zip.entries().collect { it.name } as Set
+        zip.close()
+        def required = ['META-INF/mods.toml', 'octant.png', 'pack.mcmeta', 'content/tips.tsv',
+                        'com/octant/forge/v1_21_1/OctantForgeMod.class',
+                        'com/octant/forge/v1_21_1/OctantForgeHost.class',
+                        'com/octant/capture/CaptureRuntime.class',
+                        'com/octant/capture/ModExportRunner.class']
+        def missing = required.findAll { !names.contains(it) }
+        if (!missing.isEmpty()) {
+            throw new GradleException('产物缺少必需条目：' + missing.join(', '))
+        }
+        def fonts = names.findAll { it.endsWith('.ttf') }
+        if (fonts.isEmpty()) { throw new GradleException('产物里没有报告字体资产（.ttf）') }
+        def banned = names.findAll {
+            it.startsWith('org/apache/pdfbox/') || it.startsWith('org/apache/fontbox/')
+                    || it.startsWith('org/jfree/')
+        }
+        if (!banned.isEmpty()) {
+            throw new GradleException('产物里出现 PDFBox/JFreeChart 的类（' + banned.size() + ' 条）')
+        }
+        logger.lifecycle('verifyModJar: PASS — ' + f.name + '（'
+                + String.format('%.2f', f.length() / 1048576.0) + ' MB），'
+                + names.size() + ' 个条目，' + fonts.size() + ' 个字体资产')
+    }
+}

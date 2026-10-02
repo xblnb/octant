@@ -1,0 +1,666 @@
+import groovy.json.JsonSlurper
+
+ext {
+    dcContractDoc  = 'docs/design/data-contracts.md'
+    privSchemaDir  = 'docs/privacy/schema'
+    samplesDir     = 'samples'
+}
+
+ext.modelVersionRegistry = [
+        'analysis-output-model@2.0.0': [
+                label    : '2.0.0',
+                forbidden: [
+                        sampleBasis : (['aggregate_ticks', 'aggregate_counts'] as Set),
+                        sourceMarker: (['save_aggregate_snapshot'] as Set),
+                        sourceKind  : (['save_aggregate_snapshot'] as Set),
+                        reasonCode  : (['INPUT_SNAPSHOT_ONLY'] as Set),
+                ],
+        ],
+        'analysis-output-model@3.0.0': [
+                label    : '3.0.0',
+                forbidden: [
+                        sampleBasis : ([] as Set),
+                        sourceMarker: (['vanilla_aggregate_snapshot'] as Set),
+                        sourceKind  : (['vanilla_aggregate_snapshot'] as Set),
+                        reasonCode  : ([] as Set),
+                ],
+        ],
+]
+
+def parseStatusEnum = { String text ->
+    def rows = text.readLines().findAll { it.startsWith('| `status` | enum |') }
+    if (rows.isEmpty()) return null
+    def values = [] as LinkedHashSet
+    rows.each { row ->
+        def cols = row.split('\\|', -1)
+        if (cols.length <= 4) return
+        def cell = cols[4]
+        def cut = cell.indexOf('（')
+        if (cut >= 0) cell = cell.substring(0, cut)
+        def m = cell =~ /`([a-z_]+)`/
+        while (m.find()) values << m.group(1)
+    }
+    return values.isEmpty() ? null : values
+}
+
+def parseConfidenceEnum = { String text ->
+    def row = text.readLines().find { it.contains('项都存在 `confidence` 且 ∈') }
+    if (row == null) return null
+    def open = row.indexOf('{')
+    def close = row.indexOf('}', open)
+    if (open < 0 || close < 0) return null
+    def values = [] as LinkedHashSet
+    def m = row.substring(open, close) =~ /`([a-z_]+)`/
+    while (m.find()) values << m.group(1)
+    return values.isEmpty() ? null : values
+}
+
+def isBlank = { v -> v == null || !(v instanceof String) || v.trim().isEmpty() }
+
+def FORBIDDEN_AXES = ['sampleBasis', 'sourceKind', 'sourceMarker', 'reasonCode'] as List
+
+def forbiddenOf = { Object rules ->
+    if (!(rules instanceof Map)) return null
+    def inner = rules['forbidden']
+    return (inner instanceof Map) ? inner : null
+}
+
+def isAxisMissing = { Object rules, String axis ->
+    if (rules == null) return false
+    def fb = forbiddenOf(rules)
+    if (fb == null) return true
+    return !fb.containsKey(axis)
+}
+
+def versionLabelOf = { Object rules ->
+    if (rules instanceof Map && rules['label'] != null) return "${rules['label']}".toString()
+    return '?'
+}
+
+def checkMetricsDoc = { Map doc, Set statusSet, Set confidenceSet, Map rules = null ->
+    def problems = []
+    def items = doc?.metrics
+    if (!(items instanceof List)) {
+        return ["顶层缺少 metrics 数组（实际：${items == null ? 'null' : items.getClass().simpleName}）"]
+    }
+    def seen = [] as LinkedHashSet
+    items.eachWithIndex { it, i ->
+        def tag = "metrics[${i}]"
+        if (!(it instanceof Map)) { problems << "${tag}: 条目不是对象"; return }
+        def id = it['metricId']
+        if (isBlank(id)) {
+            problems << "${tag}: 缺 metricId 或为空"
+        } else if (!seen.add(id)) {
+            problems << "${tag}: metricId 重复 '${id}'（包内必须唯一）"
+        } else {
+            tag = "metrics[${i}](metricId=${id})"
+        }
+        def st = it['status']
+        if (!statusSet.contains(st)) {
+            problems << "${tag}: status='${st}' 不在权威闭集 ${statusSet}"
+        }
+        def cf = it['confidence']
+        if (isBlank(cf)) {
+            problems << "${tag}: confidence 缺失或为空（§4.4 强制条款：任何状态下都必须存在且非空）"
+        } else if (!confidenceSet.contains(cf)) {
+            problems << "${tag}: confidence='${cf}' 不在权威闭集 ${confidenceSet}"
+        }
+        def ss = it['sampleSize']
+        if (ss == null) {
+            problems << "${tag}: sampleSize 缺失（§4.3 强制条款：任何状态下都必须存在且非空）"
+        } else if (ss instanceof Map && ss.isEmpty()) {
+            problems << "${tag}: sampleSize 为空对象（§4.3 要求非空）"
+        }
+        if (['suppressed', 'unavailable', 'error', 'unknown'].contains(st) && !isBlank(cf) && cf != 'suppressed') {
+            problems << "${tag}: status=${st} 时 confidence 必须为 'suppressed'，实际 '${cf}'"
+        }
+        def rc = it['reasonCode']
+        if (['suppressed', 'unavailable', 'error'].contains(st)) {
+            if (isBlank(rc)) problems << "${tag}: status=${st} 时 reasonCode 必填"
+        } else if (st == 'zero' && rc != null) {
+            problems << "${tag}: status=zero 时**禁止** reasonCode（零值须用 zeroCode 表达）"
+        }
+        if (st == 'zero' && isBlank(it['zeroCode'])) {
+            problems << "${tag}: status=zero 时必须给 zeroCode"
+        }
+        if (st == 'unknown' && it['unresolvedCount'] == null) {
+            problems << "${tag}: status=unknown 时必须给 unresolvedCount"
+        }
+        def normForbidden = forbiddenOf(rules)
+        def rulesLabel = versionLabelOf(rules)
+        def ssMap = (ss instanceof Map) ? ss : [:]
+        ['sampleBasis', 'sourceKind'].each { pv ->
+            def val = ssMap[pv]
+            if (val == null) return
+            if (isAxisMissing(rules, pv)) {
+                problems << "${tag}: 版本专有规则缺轴——注册表条目 ${rulesLabel} 未登记 '${pv}' 轴，无法断言 sampleSize.${pv}='${val}'（缺轴即拒，不得静默放过）".toString()
+            } else if (normForbidden != null && normForbidden[pv] != null && normForbidden[pv].contains(val)) {
+                problems << "${tag}: sampleSize.${pv}='${val}' 不属于该包自称版本 ${rulesLabel} 的取值集合（版本专有约束）".toString()
+            }
+        }
+        if (it['sourceMarker'] != null) {
+            def smVal = it['sourceMarker']
+            if (isAxisMissing(rules, 'sourceMarker')) {
+                problems << "${tag}: 版本专有规则缺轴——注册表条目 ${rulesLabel} 未登记 'sourceMarker' 轴，无法断言 sourceMarker='${smVal}'（缺轴即拒）".toString()
+            } else if (normForbidden != null && normForbidden['sourceMarker'] != null && normForbidden['sourceMarker'].contains(smVal)) {
+                problems << "${tag}: sourceMarker='${smVal}' 不属于该包自称版本 ${rulesLabel}（版本专有约束）".toString()
+            }
+        }
+        if (rc != null) {
+            if (isAxisMissing(rules, 'reasonCode')) {
+                problems << "${tag}: 版本专有规则缺轴——注册表条目 ${rulesLabel} 未登记 'reasonCode' 轴，无法断言 reasonCode='${rc}'（缺轴即拒）".toString()
+            } else if (normForbidden != null && normForbidden['reasonCode'] != null && normForbidden['reasonCode'].contains(rc)) {
+                problems << "${tag}: reasonCode='${rc}' 不属于该包自称版本 ${rulesLabel}（版本专有约束）".toString()
+            }
+        }
+    }
+    return problems
+}
+
+def checkConclusionsDoc = { Map doc, Set statusSet, Set confidenceSet, Set metricIdsInBundle, Map rules = null ->
+    def problems = []
+    def items = doc?.conclusions
+    if (!(items instanceof List)) {
+        return ["顶层缺少 conclusions 数组（实际：${items == null ? 'null' : items.getClass().simpleName}）"]
+    }
+    if (metricIdsInBundle == null) {
+        problems << '(参照完整性无法判定：metrics.json 未成功读取 metricId 全集)'
+    }
+    def seen = [] as LinkedHashSet
+    items.eachWithIndex { it, i ->
+        def tag = "conclusions[${i}]"
+        if (!(it instanceof Map)) { problems << "${tag}: 条目不是对象"; return }
+        def id = it['conclusionId']
+        if (isBlank(id)) {
+            problems << "${tag}: 缺 conclusionId 或为空"
+        } else if (!seen.add(id)) {
+            problems << "${tag}: conclusionId 重复 '${id}'"
+        } else {
+            tag = "conclusions[${i}](conclusionId=${id})"
+        }
+        def st = it['status']
+        if (st != null && !statusSet.contains(st)) {
+            problems << "${tag}: status='${st}' 不在权威闭集 ${statusSet}"
+        }
+        def cf = it['confidence']
+        if (isBlank(cf)) {
+            problems << "${tag}: confidence 缺失或为空（§4.4 强制条款）"
+        } else if (!confidenceSet.contains(cf)) {
+            problems << "${tag}: confidence='${cf}' 不在权威闭集 ${confidenceSet}"
+        }
+        if (['suppressed', 'unavailable', 'error', 'unknown'].contains(st) && !isBlank(cf) && cf != 'suppressed') {
+            problems << "${tag}: status=${st} 时 confidence 必须为 'suppressed'，实际 '${cf}'"
+        }
+        def crc = it['reasonCode']
+        if (crc != null) {
+            def cNorm = forbiddenOf(rules)
+            def cLabel = versionLabelOf(rules)
+            if (isAxisMissing(rules, 'reasonCode')) {
+                problems << "${tag}: 版本专有规则缺轴——注册表条目 ${cLabel} 未登记 'reasonCode' 轴，无法断言 reasonCode='${crc}'（缺轴即拒）".toString()
+            } else if (cNorm != null && cNorm['reasonCode'] != null && cNorm['reasonCode'].contains(crc)) {
+                problems << "${tag}: reasonCode='${crc}' 不属于该包自称版本 ${cLabel}（版本专有约束）".toString()
+            }
+        }
+        def refs = it['metricIds']
+        if (refs instanceof List && metricIdsInBundle != null) {
+            refs.each { r ->
+                if (!metricIdsInBundle.contains(r)) {
+                    problems << "${tag}: 引用了 metrics.json 中不存在的 metricId '${r}'"
+                }
+            }
+        }
+    }
+    return problems
+}
+
+tasks.register('assertContractConformance') {
+    group = 'verification'
+    description = '守卫 II：断言导出物（samples/**）符合 dc@1.4.0 输出模型契约（status/confidence/sampleSize/reasonCode/metricId）'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        def fail = { String m -> throw new GradleException("[FAIL] 守卫 II 契约一致性失败：\n" + m) }
+        def undecidable = { String m -> throw new GradleException('[无法判定] 守卫 II 无法判定：' + m) }
+        def detectorBroken = { String m -> throw new GradleException('[判定器不可用] 守卫 II 判定器不可信：' + m) }
+
+        def dcFile = file(dcContractDoc)
+        if (!dcFile.isFile()) undecidable("权威契约文档不存在：${dcContractDoc}")
+        def dcText = dcFile.getText('UTF-8')
+
+        def statusSet = parseStatusEnum(dcText)
+        def confidenceSet = parseConfidenceEnum(dcText)
+        if (statusSet == null) {
+            undecidable("未能从 ${dcContractDoc} 解析出 status 闭集（期望形如 '| `status` | enum | **MUST** | `a` / `b` |' 的行）。" +
+                    '这属于"契约文档改版但解析器没跟上"，不是契约违例。')
+        }
+        if (confidenceSet == null) {
+            undecidable("未能从 ${dcContractDoc} 解析出 confidence 闭集（期望含 '项都存在 `confidence` 且 ∈ {...}' 的行）。")
+        }
+        logger.lifecycle("守卫 II 权威闭集（来自 ${dcContractDoc}）：")
+        logger.lifecycle("  status     = ${statusSet}")
+        logger.lifecycle("  confidence = ${confidenceSet}")
+
+        def goodMetrics = [metrics: [
+                [metricId: 'CTRL_AVAILABLE', status: 'available', confidence: 'estimated',
+                 sampleSize: [eventCount: 10]],
+                [metricId: 'CTRL_SUPPRESSED', status: 'suppressed', confidence: 'suppressed',
+                 sampleSize: [eventCount: 0], reasonCode: 'SAMPLE_INSUFFICIENT_UNITS'],
+                [metricId: 'CTRL_ZERO', status: 'zero', confidence: 'estimated',
+                 sampleSize: [eventCount: 5], zeroCode: 'ZERO_NO_COMBAT', value: 0],
+                [metricId: 'CTRL_UNKNOWN', status: 'unknown', confidence: 'suppressed',
+                 sampleSize: [eventCount: 1], unresolvedCount: 3],
+        ]]
+        def goodProblems = checkMetricsDoc(goodMetrics, statusSet, confidenceSet)
+        if (!goodProblems.isEmpty()) {
+            detectorBroken("合规对照文档被误判为违规 ⇒ 判定器过严，会把合规导出物判失败。违规项：${goodProblems}")
+        }
+
+        def badCases = [
+                'status 越界'          : [metrics: [[metricId: 'B1', status: 'bogus', confidence: 'estimated', sampleSize: [eventCount: 1]]]],
+                'confidence 缺失'      : [metrics: [[metricId: 'B2', status: 'available', sampleSize: [eventCount: 1]]]],
+                'confidence 越界'      : [metrics: [[metricId: 'B3', status: 'available', confidence: 'low', sampleSize: [eventCount: 1]]]],
+                'sampleSize 缺失'      : [metrics: [[metricId: 'B4', status: 'available', confidence: 'estimated']]],
+                'sampleSize 空对象'    : [metrics: [[metricId: 'B5', status: 'available', confidence: 'estimated', sampleSize: [:]]]],
+                'suppressed 缺 reasonCode': [metrics: [[metricId: 'B6', status: 'suppressed', confidence: 'suppressed', sampleSize: [eventCount: 0]]]],
+                'zero 带 reasonCode'   : [metrics: [[metricId: 'B7', status: 'zero', confidence: 'estimated', sampleSize: [eventCount: 1], zeroCode: 'Z', reasonCode: 'R']]],
+                'zero 缺 zeroCode'     : [metrics: [[metricId: 'B8', status: 'zero', confidence: 'estimated', sampleSize: [eventCount: 1]]]],
+                'status/confidence 映射错': [metrics: [[metricId: 'B9', status: 'suppressed', confidence: 'estimated', sampleSize: [eventCount: 0], reasonCode: 'R']]],
+                'unknown 缺 unresolvedCount': [metrics: [[metricId: 'B10', status: 'unknown', confidence: 'suppressed', sampleSize: [eventCount: 1]]]],
+                'metricId 缺失'        : [metrics: [[status: 'available', confidence: 'estimated', sampleSize: [eventCount: 1]]]],
+                'metricId 重复'        : [metrics: [
+                        [metricId: 'DUP', status: 'available', confidence: 'estimated', sampleSize: [eventCount: 1]],
+                        [metricId: 'DUP', status: 'available', confidence: 'estimated', sampleSize: [eventCount: 1]],
+                ]],
+        ]
+        def unreachable = []
+        badCases.each { name, doc ->
+            if (checkMetricsDoc(doc, statusSet, confidenceSet).isEmpty()) unreachable << name
+        }
+        if (!unreachable.isEmpty()) {
+            detectorBroken("以下违规对照**未被判出** ⇒ 对应失败分支不可达，PASS 无意义：" + unreachable.join('、'))
+        }
+        def goodConclusions = [conclusions: [
+                [conclusionId: 'C1', status: 'available', confidence: 'estimated', metricIds: ['CTRL_AVAILABLE']],
+        ]]
+        def ctrlIds = ['CTRL_AVAILABLE', 'CTRL_SUPPRESSED', 'CTRL_ZERO', 'CTRL_UNKNOWN'] as Set
+        if (!checkConclusionsDoc(goodConclusions, statusSet, confidenceSet, ctrlIds).isEmpty()) {
+            detectorBroken('合规结论对照文档被误判为违规')
+        }
+        def badConclusionCases = [
+                '结论 status 越界'      : [conclusions: [[conclusionId: 'C2', status: 'bogus', confidence: 'estimated']]],
+                '结论引用不存在的 metricId': [conclusions: [[conclusionId: 'C3', status: 'available', confidence: 'estimated', metricIds: ['NO_SUCH_METRIC']]]],
+                '结论 confidence 缺失'  : [conclusions: [[conclusionId: 'C4', status: 'available']]],
+        ]
+        def cUnreachable = []
+        badConclusionCases.each { name, doc ->
+            if (checkConclusionsDoc(doc, statusSet, confidenceSet, ctrlIds).isEmpty()) cUnreachable << name
+        }
+        if (!cUnreachable.isEmpty()) {
+            detectorBroken("以下结论违规对照**未被判出**：" + cUnreachable.join('、'))
+        }
+        logger.lifecycle("守卫 II 对照 PASS — 合规对照被接受(1+1)，违规对照被逐条判出(${badCases.size()}+${badConclusionCases.size()})，失败分支全部可达")
+        def v2Rules = modelVersionRegistry['analysis-output-model@2.0.0']
+        def v3Rules = modelVersionRegistry['analysis-output-model@3.0.0']
+        def v2Forbidden = forbiddenOf(v2Rules)
+        def v3Forbidden = forbiddenOf(v3Rules)
+
+        modelVersionRegistry.each { key, entry ->
+            def fb = forbiddenOf(entry)
+            if (fb == null) {
+                detectorBroken("注册表条目 '${key}' 没有可用的 forbidden 映射 ⇒ 该版本所有 token 轴都无法断言（fail-open 形态）")
+            }
+            def missingAxes = FORBIDDEN_AXES.findAll { !fb.containsKey(it) }
+            if (!missingAxes.isEmpty()) {
+                detectorBroken("注册表条目 '${key}' 缺轴 ${missingAxes} ⇒ 这些轴恒不命中（fail-open 形态）。" +
+                        "必须显式登记（确实不禁某取值时登记空集 []，而不是省略该轴）")
+            }
+        }
+        if (v3Forbidden.toString() != forbiddenOf(v3Rules).toString() || v3Forbidden.containsKey('label')) {
+            detectorBroken('forbiddenOf 未把注册表条目归一为 token 映射 ⇒ 断言会取到 null 而不开火')
+        }
+
+        def v3StructProbe = [metrics: [[metricId: 'CTRL_STRUCT', status: 'available', confidence: 'estimated',
+                                        sampleSize: [eventCount: 1, sampleBasis: 'units', sourceKind: 'event_stream',
+                                                     minRequired: 3, minRequiredUnit: '个']]]]
+        def v3StructProblems = checkMetricsDoc(v3StructProbe, statusSet, confidenceSet, v3Rules)
+        if (!v3StructProblems.isEmpty()) {
+            detectorBroken("产物级结构对照被判违规 ⇒ 对照数据本身形状不合规，不是版本规则问题：${v3StructProblems}")
+        }
+
+        def versionAxes = [
+                [name: 'sampleBasis（sampleSize 内）',
+                 doc : { String v -> [metrics: [[metricId: ('TOK_SB_' + v) as String, status: 'available', confidence: 'estimated',
+                                                sampleSize: [eventCount: 1, sampleBasis: v, sourceKind: 'event_stream',
+                                                             minRequired: 3, minRequiredUnit: '刻']]]] },
+                 v3Only: 'aggregate_ticks', v2Only: null,
+                 in: { Map d, Map rules -> checkMetricsDoc(d, statusSet, confidenceSet, rules) }],
+                [name: 'sourceKind（sampleSize 内）',
+                 doc : { String v -> [metrics: [[metricId: ('TOK_SK_' + v) as String, status: 'available', confidence: 'estimated',
+                                                sampleSize: [eventCount: 1, sampleBasis: 'units', sourceKind: v,
+                                                             minRequired: 3, minRequiredUnit: '个']]]] },
+                 v3Only: 'save_aggregate_snapshot', v2Only: 'vanilla_aggregate_snapshot',
+                 in: { Map d, Map rules -> checkMetricsDoc(d, statusSet, confidenceSet, rules) }],
+                [name: 'sourceMarker（条目顶层）',
+                 doc : { String v -> [metrics: [[metricId: ('TOK_SM_' + v) as String, status: 'available', confidence: 'estimated',
+                                                sampleSize: [eventCount: 1], sourceMarker: v]]] },
+                 v3Only: 'save_aggregate_snapshot', v2Only: 'vanilla_aggregate_snapshot',
+                 in: { Map d, Map rules -> checkMetricsDoc(d, statusSet, confidenceSet, rules) }],
+                [name: 'reasonCode（条目顶层）',
+                 doc : { String v -> [metrics: [[metricId: ('TOK_RC_' + v) as String, status: 'suppressed', confidence: 'suppressed',
+                                                sampleSize: [eventCount: 0], reasonCode: v]]] },
+                 v3Only: 'INPUT_SNAPSHOT_ONLY', v2Only: null,
+                 in: { Map d, Map rules -> checkMetricsDoc(d, statusSet, confidenceSet, rules) }],
+                [name: 'reasonCode（结论顶层）',
+                 doc : { String v -> [conclusions: [[conclusionId: ('TOK_CRC_' + v) as String, status: 'suppressed',
+                                                     confidence: 'suppressed', reasonCode: v]]] },
+                 v3Only: 'INPUT_SNAPSHOT_ONLY', v2Only: null,
+                 in: { Map d, Map rules -> checkConclusionsDoc(d, statusSet, confidenceSet, [] as Set, rules) }],
+        ]
+        versionAxes.each { axis ->
+            if (axis.v3Only != null) {
+                def problemsV2 = axis.in(axis.doc(axis.v3Only), v2Rules)
+                if (problemsV2.isEmpty()) {
+                    detectorBroken("对照失灵[${axis.name}]：3.0.0 专有 token '${axis.v3Only}' 出现在自称 2.0.0 的产物里却未判违规" +
+                            ' ⇒ 该轴的版本专有规则未生效（不是"没被触发"，是**判定器不开火**）')
+                }
+                def problemsV3 = axis.in(axis.doc(axis.v3Only), v3Rules)
+                if (!problemsV3.isEmpty()) {
+                    detectorBroken("对照失灵[${axis.name}]：3.0.0 合法 token '${axis.v3Only}' 在自称 3.0.0 的产物里被判违规" +
+                            " ⇒ 规则表用错（本版本应接受的被拒）：${problemsV3}")
+                }
+            }
+            if (axis.v2Only != null) {
+                def problemsV3Old = axis.in(axis.doc(axis.v2Only), v3Rules)
+                if (problemsV3Old.isEmpty()) {
+                    detectorBroken("对照失灵[${axis.name}]：2.0.0 旧 token '${axis.v2Only}' 出现在自称 3.0.0 的产物里却未判违规" +
+                            ' ⇒ 替换语义未生效（并列两个取值 = 门禁认两个 token）')
+                }
+                def problemsV2Old = axis.in(axis.doc(axis.v2Only), v2Rules)
+                if (!problemsV2Old.isEmpty()) {
+                    detectorBroken("对照失灵[${axis.name}]：2.0.0 合法 token '${axis.v2Only}' 在自称 2.0.0 的产物里被判违规" +
+                            " ⇒ 规则表用错：${problemsV2Old}")
+                }
+            }
+        }
+        logger.lifecycle("守卫 II 版本专有对照 PASS — 逐轴双向（${versionAxes.size()} 轴）：" +
+                '3.0.0 专有 token 在 2.0.0 下被拒、在 3.0.0 下被接受；2.0.0 旧 token 在 3.0.0 下被拒、在 2.0.0 下被接受' +
+                '（并按生产产物的真实承载位置取值：sampleBasis/sourceKind ∈ sampleSize，sourceMarker/reasonCode ∈ 条目顶层）')
+
+        def resolveDeclared = { Object raw ->
+            if (raw == null || !(raw instanceof String) || raw.trim().isEmpty()) {
+                return [status: 'missing', declared: null]
+            }
+            def d = raw.trim()
+            if (!modelVersionRegistry.containsKey(d)) {
+                return [status: 'unknown', declared: d]
+            }
+            return [status: 'ok', declared: d, rules: modelVersionRegistry[d]]
+        }
+        def badAccepted = []
+        [null, '', 'analysis-output-model@9.9.9', 'analysis-output-model@1.9.9', 'not-a-version@1.0.0'].each { bad ->
+            if (resolveDeclared(bad).status == 'ok') badAccepted << String.valueOf(bad)
+        }
+        if (!badAccepted.isEmpty()) {
+            detectorBroken("以下自称版本未被阻断（fail-open 未修复）：${badAccepted}")
+        }
+        ['analysis-output-model@2.0.0', 'analysis-output-model@3.0.0'].each { ok ->
+            if (resolveDeclared(ok).status != 'ok') detectorBroken("已登记版本 '${ok}' 未被接受：${resolveDeclared(ok)}")
+        }
+        logger.lifecycle('守卫 II 版本阻断对照 PASS — 表外/缺失自称版本全部被阻断（null、空串、@9.9.9、@1.9.9、not-a-version@1.0.0）；两个已登记版本被接受')
+        logger.lifecycle("守卫 II 受支持版本注册表：${modelVersionRegistry.keySet().sort()}（未登记即阻断）")
+        def samplesLocation = (project.findProperty('octant.samples.dir') ?: samplesDir).toString()
+        def dir = file(samplesLocation)
+        if (samplesLocation != samplesDir) {
+            logger.lifecycle("守卫 II：校验对象被 -Poctant.samples.dir 覆盖为 ${samplesLocation}（默认 ${samplesDir}）")
+        }
+        if (!dir.isDirectory()) undecidable("导出物目录不存在：${samplesLocation}")
+        def discoverBundles = {
+            dir.listFiles()
+                    ?.findAll { it.isDirectory() && new File(it, 'metrics.json').isFile() }
+                    ?.sort { it.name } ?: []
+        }
+        def maxAttempts = 7
+        def attempts = 0
+        def bundles = []
+        while (attempts < maxAttempts) {
+            attempts++
+            bundles = discoverBundles()
+            if (!bundles.isEmpty()) break
+            if (attempts < maxAttempts) {
+                logger.lifecycle("守卫 II：第 ${attempts}/${maxAttempts - 1} 次未发现导出包" +
+                        '（样品包可能正被 `:pipeline:test` 族测试先删后写），5s 后复试…')
+                Thread.sleep(5000L)
+            }
+        }
+        if (attempts > 1 && !bundles.isEmpty()) {
+            logger.lifecycle("守卫 II：复试第 ${attempts} 次后读到导出包 ⇒ 前一次空目录确属并发写窗口（非契约问题）")
+        }
+        if (bundles.isEmpty()) {
+            def entries = dir.listFiles()?.collect { it.name }?.sort() ?: []
+            undecidable("在 ${samplesDir} 下未找到任何含 metrics.json 的导出包" +
+                    "（已复试 ${attempts} 次、累计等待约 ${(attempts - 1) * 5}s，仍为空 ⇒ 不是写窗口）。\n" +
+                    "  解析到的绝对路径：${dir.absolutePath}\n" +
+                    "  该目录存在：${dir.isDirectory()}；直接条目数：${entries.size()}；条目：${entries.isEmpty() ? '（空）' : entries.join(', ')}\n" +
+                    '  没有可校验对象级证据 ⇒ 不报 PASS（「结构就绪 ≠ 能力可用」）。\n' +
+                    '  最可能是导出包确实还没生成：先在 mc-insight mod 里跑一次导出（见 `README.md` §5 的一条命令闭环）。')
+        }
+
+        def allProblems = []
+        def bundleAudit = []
+        bundles.each { bundle ->
+            def mf = new File(bundle, 'metrics.json')
+            def cf = new File(bundle, 'conclusions.json')
+            Map metricsDoc
+            try {
+                metricsDoc = new JsonSlurper().parse(mf, 'UTF-8') as Map
+            } catch (Exception e) {
+                undecidable("${mf.name} 无法解析为 JSON：${e.message}。解析失败≠契约违例。\n" +
+                        "  文件：${mf.absolutePath}；大小 ${mf.length()} B；mtime ${new Date(mf.lastModified())}" +
+                        '（若文件看起来是半截的，说明正被并发写入）。')
+            }
+            def declaredRaw = metricsDoc['schemaVersion']
+            def declared = (declaredRaw instanceof String) ? declaredRaw.trim() : null
+            logger.lifecycle("校验导出包 ${bundle.name}：自称 schemaVersion=${declaredRaw == null ? '（缺失）' : declaredRaw}")
+
+            def versionInfo
+            if (declared == null || declared.isEmpty()) {
+                allProblems << ("${bundle.name}: metrics.json 未携带 schemaVersion（无法判定其规则版本）" +
+                        " ⇒ **阻断**（fail-closed）。受支持的自称版本：${modelVersionRegistry.keySet().sort()}")
+                versionInfo = [accessible: false]
+            } else if (!modelVersionRegistry.containsKey(declared)) {
+                allProblems << ("${bundle.name}: 自称模型版本 '${declared}' **未登记**在守卫的受支持版本注册表 " +
+                        "${modelVersionRegistry.keySet().sort()} ⇒ **阻断**（fail-closed）——" +
+                        '「声明一个新版本号」不能成为逃出门禁的手段；契约升版后必须在 modelVersionRegistry 登记新版本')
+                versionInfo = [accessible: false]
+            } else {
+                versionInfo = [accessible: true, rules: modelVersionRegistry[declared]]
+                logger.lifecycle("  ⇒ 按自称版本 ${declared} 的规则断言（结构断言 + 该版本专有 token 约束）")
+            }
+            def rules = versionInfo.accessible ? versionInfo.rules : null
+            if (versionInfo.accessible && forbiddenOf(rules) == null) {
+                allProblems << ("${bundle.name}: 自称版本 '${declared}' 的注册表条目缺少可用的 forbidden 映射 ⇒ " +
+                        '**阻断**（规则表不可用时不得放行；契约升版后登记条目必须含 forbidden）')
+                versionInfo = [accessible: false, reason: '规则表不可用']
+                rules = null
+            }
+
+            def metricIds = (metricsDoc['metrics'] instanceof List)
+                    ? (metricsDoc['metrics'].collect { it instanceof Map ? it['metricId'] : null }
+                            .findAll { it != null } as Set) : null
+            if (metricIds == null) {
+                allProblems << "${bundle.name}: metrics.json 顶层缺少 metrics 数组，无法建立 metricId 全集"
+            }
+            if (versionInfo.accessible) {
+                allProblems.addAll(checkMetricsDoc(metricsDoc, statusSet, confidenceSet, rules)
+                        .collect { "${bundle.name}/${it}" })
+            }
+
+            def byStatus = [:]
+            (metricsDoc['metrics'] ?: []).each { m ->
+                if (m instanceof Map) {
+                    def k = "${m['status']}/${m['confidence']}"
+                    byStatus[k] = (byStatus[k] ?: 0) + 1
+                }
+            }
+            logger.lifecycle('  实测 status/confidence 组合：' + byStatus.sort().collect { k, v -> "${k}×${v}" }.join(', '))
+            def rcs = (metricsDoc['metrics'] ?: []).collect { it instanceof Map ? it['reasonCode'] : null }
+                    .findAll { it != null }.unique().sort()
+            def zcs = (metricsDoc['metrics'] ?: []).collect { it instanceof Map ? it['zeroCode'] : null }
+                    .findAll { it != null }.unique().sort()
+            logger.lifecycle("  实测 reasonCode（仅列值，闭集校验见文件头留白说明）：${rcs.isEmpty() ? '（无）' : rcs.join(', ')}")
+            logger.lifecycle("  实测 zeroCode  ：${zcs.isEmpty() ? '（无）' : zcs.join(', ')}")
+
+            if (cf.isFile()) {
+                Map conclusionsDoc
+                try {
+                    conclusionsDoc = new JsonSlurper().parse(cf, 'UTF-8') as Map
+                } catch (Exception e) {
+                    undecidable("${cf.name} 无法解析为 JSON：${e.message}。\n" +
+                            "  文件：${cf.absolutePath}；大小 ${cf.length()} B；mtime ${new Date(cf.lastModified())}")
+                }
+                if (versionInfo.accessible) {
+                    allProblems.addAll(checkConclusionsDoc(conclusionsDoc, statusSet, confidenceSet, metricIds, rules)
+                            .collect { "${bundle.name}/${it}" })
+                } else {
+                    logger.lifecycle("  （该包自称版本不可判定 ⇒ 已阻断，结论侧不再重复报违例）")
+                }
+            } else {
+                logger.lifecycle("  （无 conclusions.json，跳过结论校验）")
+            }
+            bundleAudit << ("${bundle.name}: 自称 ${declared == null ? '（缺失）' : declared} → " +
+                    (versionInfo.accessible ? "按 ${versionInfo.rules.label} 规则断言" : '**已阻断**（未登记/缺失版本/规则表不可用）'))
+        }
+
+        def pipelineProj = project.findProject(':pipeline')
+        if (pipelineProj == null) {
+            undecidable('无法检查第三方白名单版本：工程 :pipeline 未纳入本次构建（权威白名单在 pipeline/build.gradle）')
+        }
+        def whitelistFile = new File(pipelineProj.projectDir, 'build.gradle')
+        if (!whitelistFile.isFile()) undecidable("权威白名单所在文件不存在：${whitelistFile}")
+        def wlText = whitelistFile.getText('UTF-8')
+
+        def wlEntries = [:]
+        def wlBlock = wlText
+        def blockStart = wlBlock.indexOf('thirdPartyWhitelist')
+        if (blockStart < 0) undecidable("在 ${whitelistFile} 中找不到 thirdPartyWhitelist（权威定义处）")
+        def blockSlice = wlBlock.substring(blockStart)
+        def entryRe = ~/(?m)^\s*'([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+)(?::([A-Za-z0-9_.\-]+))?'\s*:/
+        def metaRe = ~/(license|licenseInJar|licenseText)\s*:\s*'([^']*)'/
+        def entryMatches = entryRe.matcher(blockSlice)
+        def lastCoord = null
+        while (entryMatches.find()) {
+            def coord = "${entryMatches.group(1)}:${entryMatches.group(2)}".toString()
+            def ver = entryMatches.group(3)
+            wlEntries[coord] = [versionFromKey: (ver == null ? null : ver.toString()),
+                                license: null, licenseInJar: null, licenseText: null]
+            lastCoord = coord
+        }
+        def entrySpans = []
+        entryMatches = entryRe.matcher(blockSlice)
+        while (entryMatches.find()) entrySpans << [coord: "${entryMatches.group(1)}:${entryMatches.group(2)}".toString(),
+                                                   pos  : entryMatches.start()]
+        def metaMatches = metaRe.matcher(blockSlice)
+        while (metaMatches.find()) {
+            def pos = metaMatches.start()
+            def owner = entrySpans.findAll { it.pos < pos }.max { it.pos }
+            if (owner != null && wlEntries[owner.coord] != null) {
+                wlEntries[owner.coord][metaMatches.group(1)] = metaMatches.group(2)
+            }
+        }
+        if (wlEntries.isEmpty()) undecidable("未能从 ${whitelistFile} 解析出任何白名单条目（解析器需跟上格式）")
+
+        def wlCfg = pipelineProj.configurations.findByName('runtimeClasspath')
+        def wlResolved = (wlCfg == null) ? [] : wlCfg.resolvedConfiguration.resolvedArtifacts.collect {
+            [coord: "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}".toString(),
+             version: it.moduleVersion.id.version.toString(), file: it.file] as Map
+        }.findAll { it.coord != 'com.octant:common' }
+        if (wlResolved.isEmpty()) undecidable('无法判定：:pipeline 运行时闭包一个外部制品都没解析出来（解析失败 ≠ 版本一致）')
+
+        def injectUnaudited = project.findProperty('octant.guard.injectUnauditedVersion')?.toString() == 'true'
+        if (injectUnaudited) {
+            wlResolved = [([coord: 'commons-logging:commons-logging', version: '1.2',
+                            file: new File('injected-by-property')] as Map)] + wlResolved
+            logger.lifecycle('!! 反向对照已启用：把 commons-logging 的解析版本注入为 1.2 ⇒ 本守卫应当失败')
+        }
+
+        def versionOverride = project.findProperty('octant.guard.whitelistVersionOverride')?.toString()
+        def declaredOverrides = [:]
+        if (versionOverride != null && !versionOverride.trim().isEmpty()) {
+            versionOverride.split(';').each { pair ->
+                def kv = pair.split('=', 2)
+                if (kv.length == 2) declaredOverrides[kv[0].trim()] = kv[1].trim()
+            }
+            if (declaredOverrides.isEmpty()) undecidable("无法解析 -Poctant.guard.whitelistVersionOverride='${versionOverride}'（期望 coord=version[;coord=version]）")
+            declaredOverrides.each { c, v ->
+                if (wlEntries[c] == null) {
+                    wlEntries[c] = [versionFromKey: null, license: null, licenseInJar: null, licenseText: null]
+                }
+                wlEntries[c].versionFromKey = v
+            }
+            logger.lifecycle("!! 反向对照已启用：把白名单条目版本声明覆盖为 ${declaredOverrides} ⇒ 若与解析版本不同，本守卫应当失败")
+        }
+
+        def missingVersionDecl = wlEntries.findAll { k, v -> v.versionFromKey == null }.keySet().sort()
+        def unauditedVersions = []
+        def unanchored = []
+        def composition = []
+        wlResolved.each { art ->
+            def meta = wlEntries[art.coord]
+            def declaredVer = meta?.versionFromKey
+            def versionOk = (declaredVer != null) && (declaredVer == art.version)
+            if (declaredVer != null && !versionOk) {
+                unauditedVersions << "${art.coord}:${art.version}（白名单声明：${declaredVer}）"
+            }
+            if (declaredVer == null) {
+                unanchored << "${art.coord}:${art.version}（白名单条目未声明版本）"
+            }
+            composition << [coord: art.coord, version: art.version, declared: declaredVer,
+                            license: (meta?.license != null) ? meta.license : '（白名单未登记许可证）',
+                            evidence: (meta?.licenseInJar != null) ? "jar:${meta.licenseInJar}"
+                                    : (meta?.licenseText != null ? "repo:${meta.licenseText}" : '（无许可文本证据）'),
+                            ok: versionOk]
+        }
+
+        logger.lifecycle('守卫 II 第三方白名单**构成自证**（坐标 + 版本 + 许可证 + 证据来源；权威 = pipeline/build.gradle）：')
+        composition.sort { it.coord }.each { r ->
+            logger.lifecycle(String.format('    %-42s %-10s 声明=%-10s %-12s %-28s %s',
+                    r.coord, r.version, r.declared == null ? '（缺）' : r.declared, r.license, r.evidence,
+                    (r.declared == null) ? '版本无锚点' : (r.ok ? 'OK' : '**版本越界**')))
+        }
+        logger.lifecycle("    共 ${composition.size()} 件外部制品；白名单条目 ${wlEntries.size()} 条" +
+                (missingVersionDecl.isEmpty()
+                        ? '（**全部已声明版本** ⇒ 每件制品的版本同一性都有锚点）'
+                        : "（其中**未声明版本** ${missingVersionDecl.size()} 条 ⇒ 这 ${missingVersionDecl.size()} 条坐标的版本同一性无锚点）"))
+
+        def requireVersions = project.findProperty('octant.guard.requireWhitelistVersions')?.toString() != 'false'
+        def anchored = wlEntries.values().findAll { it.versionFromKey != null }.size()
+        logger.lifecycle("    版本锚点：${anchored}/${wlEntries.size()} 条条目声明了版本" +
+                (missingVersionDecl.isEmpty() ? '（无缺项）' : "（**缺项** ${missingVersionDecl.size()} 条）") +
+                (requireVersions ? '；**默认常开：未声明版本即阻断**' : '；⚠️ 本 run 被 -Poctant.guard.requireWhitelistVersions=false 降级 ⇒ **未按版本阻断**'))
+
+        if (!missingVersionDecl.isEmpty() && requireVersions) {
+            allProblems << ('第三方白名单版本缺口（**默认即阻断**）：以下条目**未声明版本** ⇒ 无法区分"已审计的制品"与"同名的另一个制品"：' +
+                    "${missingVersionDecl}\n    修法：在 pipeline/build.gradle 的 thirdPartyWhitelist 里把键写成 " +
+                    "'group:name:version'（或加 version 字段并附该范围内的证据）；" +
+                    '并**同批**把该文件里**四处**按坐标查表的位置改为"查表用 `group:name`、版本另行断言"' +
+                    '（① 直接依赖 ② 已解析的传递依赖 ③ `licenseGaps` 遍历取 `licenseInJar`/`licenseText` ④ 自报构成取 meta），' +
+                    '否则带版本的键会让守卫把全部依赖判为未授权、并把构成自证打断。' +
+                    '本守卫**只解析、不代改**该文件（单源：白名单权威只有一处）。')
+        }
+        if (!unauditedVersions.isEmpty()) {
+            allProblems << ("第三方白名单**版本越界**（已声明版本 ≠ 解析版本）⇒ 实际打进包里的字节不是被审计的那个制品：" +
+                    unauditedVersions.collect { "  ${it}" }.join('\n') +
+                    '\n    反向对照：`-Poctant.guard.injectUnauditedVersion=true` 注入未审计版本 ⇒ 本守卫必红。')
+        }
+        if (!allProblems.isEmpty()) {
+            fail("共 ${allProblems.size()} 处契约违例（判定依据：${dcContractDoc}；闭集已从该文件实时解析）：\n  " +
+                    allProblems.join('\n  '))
+        }
+        logger.lifecycle("守卫 II 覆盖面自证：本次判定对象 ${bundles.size()} 个导出包" +
+                "（受支持版本注册表 ${modelVersionRegistry.keySet().sort()}）：")
+        bundleAudit.each { a -> logger.lifecycle('  · ' + a) }
+
+        logger.lifecycle("assertContractConformance: PASS — ${bundles.size()} 个导出包全部符合输出模型契约（按各自称版本分别断言）" +
+                "（status/confidence 闭集校验 + sampleSize/confidence 强制存在 + reasonCode 条件必填/对 zero 禁止 + metricId 唯一 + 结论引用完整性）")
+    }
+}

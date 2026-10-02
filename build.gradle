@@ -1,0 +1,247 @@
+plugins {
+    id 'base'
+}
+
+allprojects {
+    group = 'com.octant'
+    version = '0.1.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects {
+    plugins.withId('java') {
+        tasks.withType(JavaCompile).configureEach {
+            options.encoding = 'UTF-8'
+            options.compilerArgs << '-Xlint:all' << '-Xlint:-serial'
+            if (!options.release.isPresent()) {
+                options.release = 17
+            }
+        }
+
+        dependencies {
+            testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+        }
+
+        tasks.withType(Test).configureEach {
+            useJUnitPlatform()
+            testLogging {
+                events 'passed', 'skipped', 'failed'
+                exceptionFormat 'full'
+            }
+        }
+    }
+}
+
+def platformSkeleton = [
+        ['forge/1.20.1',    'forge',    'mc1201'],
+        ['forge/1.21.1',    'forge',    'mc1211'],
+        ['neoforge/1.20.1', 'neoforge', 'mc1201'],
+        ['neoforge/1.21.1', 'neoforge', 'mc1211'],
+        ['fabric/1.20.1',   'fabric',   'mc1201'],
+        ['fabric/1.21.1',   'fabric',   'mc1211'],
+]
+
+tasks.register('verifyPlatformSkeleton') {
+    group = 'verification'
+    description = '断言 Forge/NeoForge/Fabric × MC 1.20.1/1.21.1 六个适配层目录与构建脚本就位'
+    outputs.upToDateWhen { false }
+    doLast {
+        def missing = []
+        platformSkeleton.each { combo ->
+            def (dir, loader, mc) = combo
+            def buildFile = file("${dir}/build.gradle")
+            if (!buildFile.isFile()) {
+                missing << "${dir}/build.gradle"
+            }
+            logger.lifecycle(String.format('  %-18s %-8s %-7s %s', dir, loader, mc,
+                    buildFile.isFile() ? 'build.gradle OK' : 'build.gradle MISSING'))
+        }
+        if (!missing.isEmpty()) {
+            throw new GradleException("平台适配层骨架不完整，缺失：\n" + missing.join('\n'))
+        }
+        logger.lifecycle('verifyPlatformSkeleton: PASS — 6/6 平台组合目录与构建脚本就位')
+    }
+}
+
+def unsupportedCombos = [
+        [dir: 'forge/1.21.1',    pkg: 'forge/1.21.1/src/main/java/com/octant/forge/v1_21_1/package-info.java'],
+        [dir: 'neoforge/1.20.1', pkg: 'neoforge/1.20.1/src/main/java/com/octant/neoforge/v1_20_1/package-info.java'],
+        [dir: 'neoforge/1.21.1', pkg: 'neoforge/1.21.1/src/main/java/com/octant/neoforge/v1_21_1/package-info.java'],
+]
+
+tasks.register('assertUnsupportedCombos') {
+    group = 'verification'
+    description = '守卫 III：不受支持的平台组合必须在 build.gradle 与 package-info.java 双向显式标注'
+    outputs.upToDateWhen { false }
+    doLast {
+        def marker = 'octant.unsupported-combo: true'
+        def injected = findProperty('octant.guard.skipUnsupportedMarker')?.toString() == 'true'
+        if (injected) {
+            logger.lifecycle('!! 负向对照已启用：假装标记不存在 ⇒ 本任务应当失败')
+        }
+        def problems = []
+        unsupportedCombos.each { combo ->
+            def buildFile = file("${combo.dir}/build.gradle")
+            def pkgFile = file(combo.pkg)
+            if (!buildFile.isFile()) {
+                problems << "${combo.dir}/build.gradle 不存在（不受支持组合的目录被移除时，本守卫的映射表必须同步修改，不得静默跳过）"
+                return
+            }
+            if (injected || !buildFile.getText('UTF-8').contains(marker)) {
+                problems << "${combo.dir}/build.gradle 缺少标记 '${marker}'"
+            }
+            if (!pkgFile.isFile()) {
+                problems << "${combo.pkg} 不存在"
+            } else {
+                def text = pkgFile.getText('UTF-8')
+                if (!text.contains('不受支持') || !text.contains('UNSUPPORTED')) {
+                    problems << "${combo.pkg} 未写清『不受支持』及依据/解除条件"
+                }
+            }
+        }
+        if (!problems.isEmpty()) {
+            throw new GradleException('守卫 III 失败：不受支持的组合未被显式标注：\n  '
+                    + problems.join('\n  ')
+                    + '\n标注必须两侧都在：build.gradle 的标记（机器可查）+ package-info.java 的依据与解除条件（人可读）。')
+        }
+        logger.lifecycle('assertUnsupportedCombos: PASS — '
+                + unsupportedCombos.size() + ' 个不受支持组合均已在两侧显式标注（'
+                + unsupportedCombos.collect { it.dir }.join(', ') + '）')
+        logger.lifecycle('  注：通道为『显式不支持』，不是『待做』；解除条件逐条写在各自的 package-info.java 里。')
+    }
+}
+
+tasks.named('check') {
+    dependsOn 'assertUnsupportedCombos'
+}
+
+def hasCommonProjectDependency(def cfg) {
+    if (cfg == null) return false
+    return cfg.allDependencies.any { d ->
+        d instanceof org.gradle.api.artifacts.ProjectDependency && d.name == 'common'
+    }
+}
+
+def describeDeps(def cfg) {
+    if (cfg == null) return '<configuration 不存在>'
+    def items = cfg.allDependencies.collect { d ->
+        "${d.class.simpleName}{name=${d.name}, group=${d.group}" +
+                (d instanceof org.gradle.api.artifacts.ProjectDependency ? ', 是项目依赖' : '') + '}'
+    }
+    return items.isEmpty() ? '<空>' : items.join(', ')
+}
+
+tasks.register('assertPipelineConsumesCommon') {
+    group = 'verification'
+    description = '守卫 I：断言 :pipeline 的 compileClasspath 含 project(:common)（契约权威的构建层强制）'
+    outputs.upToDateWhen { false }
+    dependsOn ':pipeline:help', ':common:help'
+    doLast {
+        def pipelineCp = project(':pipeline').configurations.findByName('compileClasspath')
+        def controlCp = project(':common').configurations.findByName('compileClasspath')
+
+        if (pipelineCp == null || controlCp == null) {
+            throw new GradleException(
+                    '守卫 I 无法判定：取不到 compileClasspath（pipeline=' +
+                            (pipelineCp == null ? 'null' : 'ok') + ', common=' +
+                            (controlCp == null ? 'null' : 'ok') + '）。' +
+                            '这通常是"被检查的工程未参与配置"（按需配置）导致的，不是条件不满足。')
+        }
+
+        if (hasCommonProjectDependency(controlCp)) {
+            throw new GradleException(
+                    '守卫自检失败：检测器在"确实不含 :common"的配置（:common 自身的 compileClasspath）上' +
+                            '也判定为含 ⇒ 检测器不可信，本次结论无效')
+        }
+        logger.lifecycle('assertPipelineConsumesCommon: 正对照 PASS — 检测器能识别"不含 :common"的情形')
+
+        if (!hasCommonProjectDependency(pipelineCp)) {
+            throw new GradleException(
+                    '守卫 I 失败：:pipeline 的 compileClasspath 不含 project(:common)。\n' +
+                            'dc@1.4.0 冻结的「模型与 DTO 以 :common 为权威、:pipeline 只消费」当前失去构建层强制。\n' +
+                            '修法：在 pipeline/build.gradle 的 dependencies 里启用 implementation project(\':common\')\n' +
+                            "实测看到的 compileClasspath 依赖：${describeDeps(pipelineCp)}")
+        }
+        logger.lifecycle('assertPipelineConsumesCommon: PASS — :pipeline compileClasspath 含 project(:common)')
+    }
+}
+
+apply from: 'gradle/contract-conformance.gradle'
+
+tasks.named('check') {
+    dependsOn 'assertPipelineConsumesCommon'
+    dependsOn 'assertContractConformance'
+}
+
+tasks.register('reportThirdPartyFootprint') {
+    group = 'verification'
+    description = ':pipeline 运行时依赖闭包的坐标/体积清单（白名单体积取证）'
+    outputs.upToDateWhen { false }
+    dependsOn ':pipeline:help'
+    doLast {
+        def cfg = project(':pipeline').configurations.findByName('runtimeClasspath')
+        if (cfg == null) {
+            throw new GradleException('无法判定：取不到 :pipeline 的 runtimeClasspath（工程未参与配置？）')
+        }
+        def rows = cfg.resolvedConfiguration.resolvedArtifacts.collect { a ->
+            [coord: "${a.moduleVersion.id.group}:${a.moduleVersion.id.name}:${a.moduleVersion.id.version}".toString(),
+             size : a.file.length(),
+             file : a.file.name]
+        }.sort { -it.size }
+        if (rows.isEmpty()) {
+            throw new GradleException('无法判定：解析结果为空，不做体积结论')
+        }
+        long total = rows.sum { it.size } ?: 0L
+        logger.lifecycle('运行时依赖闭包（按体积降序）：')
+        rows.each { r -> logger.lifecycle(String.format('  %9.1f KB  %s', r.size / 1024.0, r.coord)) }
+        logger.lifecycle(String.format('  合计 %d 个制品 · %.1f MB', rows.size(), total / 1024.0 / 1024.0))
+        rows.groupBy { it.coord.split(':')[0] }.sort { -it.value.sum { it.size } }.each { g, v ->
+            logger.lifecycle(String.format('    %-32s %7.1f KB  (%d 件)',
+                    g, v.sum { it.size } / 1024.0, v.size()))
+        }
+    }
+}
+
+tasks.register('packThirdPartyPayload') {
+    group = 'verification'
+    description = '把运行时依赖 + 字体资产打成载荷包并实测体积（mod jar 体积代理）'
+    outputs.upToDateWhen { false }
+    dependsOn ':pipeline:help'
+    doLast {
+        def cfg = project(':pipeline').configurations.findByName('runtimeClasspath')
+        if (cfg == null) {
+            throw new GradleException('无法判定：取不到 :pipeline 的 runtimeClasspath')
+        }
+        def jars = cfg.resolvedConfiguration.resolvedArtifacts.collect { it.file }
+        def fontDir = file('pipeline/src/main/resources/com/octant/pipeline/report/font')
+        def fonts = fontDir.isDirectory() ? fontDir.listFiles().findAll { it.name.endsWith('.ttf') } : []
+        if (jars.isEmpty()) {
+            throw new GradleException('无法判定：依赖 jar 为空，不做体积结论')
+        }
+        def outDir = layout.buildDirectory.dir('payload-audit').get().asFile
+        outDir.mkdirs()
+        def payload = new File(outDir, 'mod-payload.zip')
+        if (payload.exists()) payload.delete()
+        long raw = 0
+        def zip = new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(new java.io.FileOutputStream(payload)))
+        try {
+            (jars + fonts).each { f ->
+                raw += f.length()
+                def e = new java.util.zip.ZipEntry(f.name)
+                zip.putNextEntry(e)
+                f.withInputStream { ins -> zip << ins }
+                zip.closeEntry()
+                logger.lifecycle(String.format('  + %-46s %8.1f KB', f.name, f.length() / 1024.0))
+            }
+        } finally {
+            zip.close()
+        }
+        logger.lifecycle(String.format('载荷条目 %d 个（依赖 jar %d + 字体 %d）', jars.size() + fonts.size(), jars.size(), fonts.size()))
+        logger.lifecycle(String.format('未压缩合计 %.2f MB → 压缩后 %.2f MB（%s）',
+                raw / 1024.0 / 1024.0, payload.length() / 1024.0 / 1024.0, payload.name))
+        logger.lifecycle('注：**不是**交付用的 mod jar；真 jar 由平台模块装配，其中两个组合当前不可构建。')
+    }
+}

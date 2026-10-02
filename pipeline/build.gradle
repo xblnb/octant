@@ -1,0 +1,363 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    implementation project(':common')
+
+    implementation 'org.apache.pdfbox:pdfbox:3.0.8'
+    implementation 'org.jfree:jfreechart:1.5.6'
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.junit.platform:junit-platform-launcher'
+}
+
+sourceSets {
+    test {
+        resources {
+            srcDir layout.buildDirectory.dir('e2e-out')
+        }
+    }
+}
+
+def javaSources = fileTree('src/main') {
+    include '**/*.java'
+    include '**/*.gradle'
+}
+
+def testSources = fileTree('src/test') {
+    include '**/*.java'
+}
+
+def testFixtureExemptions = [
+        ['pipeline/src/test/java/com/octant/pipeline/PrivacyRedactionTest.java', 'https://example.invalid/'],
+]
+
+tasks.register('assertNoMinecraftRefs') {
+    group = 'verification'
+    description = '断言 pipeline 源码不含任何 net.minecraft 引用'
+    inputs.files(javaSources)
+    outputs.upToDateWhen { false }
+    doLast {
+        def hits = []
+        javaSources.each { f ->
+            f.eachLine { line, no ->
+                if (line.contains('net.minecraft')) { hits << "${f.name}:${no}: ${line.trim()}" }
+            }
+        }
+        if (!hits.isEmpty()) {
+            throw new GradleException("pipeline 模块禁止引用 net.minecraft：\n" + hits.join('\n'))
+        }
+        logger.lifecycle('assertNoMinecraftRefs: PASS �?pipeline 源码�?net.minecraft 引用')
+    }
+}
+
+tasks.register('assertNoNetworkApis') {
+    group = 'verification'
+
+    inputs.files(javaSources)
+    inputs.files(testSources)
+    outputs.upToDateWhen { false }
+    doLast {
+        def forbidden = [
+                'java.' + 'net.',
+                'javax.' + 'net.',
+                'URLConnection',
+                'HttpClient',
+                'InetAddress',
+                'Socket',
+                'ServerSocket',
+                'openConnection'
+        ]
+        def urlTokens = ['http' + '://', 'https' + '://']
+        def hits = []
+        def exemptionsUsed = []
+
+        def exempt = { File f, String line ->
+            def rel = f.absolutePath.replace('\\', '/')
+            def token = urlTokens.find { line.contains(it) }
+            if (token == null) return [false, null]
+            def hit = testFixtureExemptions.find { e -> rel.endsWith(e[0]) && line.contains(e[1]) }
+            if (hit != null) {
+                exemptionsUsed << "${hit[0]}  [${hit[1]}]"
+                return [true, token]
+            }
+            return [false, token]
+        }
+
+        def stripCode = { String src ->
+            def sb = new StringBuilder(src.length())
+            int i = 0
+            int n = src.length()
+            boolean inLine = false
+            boolean inBlock = false
+            boolean inStr = false
+            boolean inChar = false
+            boolean inText = false
+            while (i < n) {
+                int c = src.charAt(i) as int
+                int d = (i + 1 < n) ? (src.charAt(i + 1) as int) : 0
+                if (inLine) {
+                    if (c == 10) { inLine = false; sb.append((char) 10) }
+                    i++
+                    continue
+                }
+                if (inBlock) {
+                    if (c == 42 && d == 47) { inBlock = false; i += 2; continue }
+                    if (c == 10) sb.append((char) 10)
+                    i++
+                    continue
+                }
+                if (inText) {
+                    if (c == 34 && d == 34 && i + 2 < n && (src.charAt(i + 2) as int) == 34) {
+                        inText = false; i += 3; continue
+                    }
+                    if (c == 10) sb.append((char) 10)
+                    i++
+                    continue
+                }
+                if (inStr) {
+                    if (c == 92) { i += 2; continue }
+                    if (c == 34) inStr = false
+                    i++
+                    continue
+                }
+                if (inChar) {
+                    if (c == 92) { i += 2; continue }
+                    if (c == 39) inChar = false
+                    i++
+                    continue
+                }
+                if (c == 47 && d == 47) { inLine = true; i += 2; continue }
+                if (c == 47 && d == 42) { inBlock = true; i += 2; continue }
+                if (c == 34 && d == 34 && i + 2 < n && (src.charAt(i + 2) as int) == 34) {
+                    inText = true; i += 3; continue
+                }
+                if (c == 34) { inStr = true; i++; continue }
+                if (c == 39) { inChar = true; i++; continue }
+                sb.append((char) c)
+                i++
+            }
+            return sb.toString()
+        }
+
+        javaSources.each { f ->
+            def text = f.getText('UTF-8')
+            stripCode(text).eachLine { line, no ->
+                def trimmed = line.trim()
+                forbidden.each { token ->
+                    if (line.contains(token)) { hits << "${f.name}:${no}: ${trimmed}  [${token}]" }
+                }
+            }
+            text.eachLine { line, no ->
+                urlTokens.each { token ->
+                    if (line.contains(token)) {
+                        hits << "${f.name}:${no}: ${line.trim()}  [${token}]"
+                    }
+                }
+            }
+        }
+        testSources.each { f ->
+            def text = f.getText('UTF-8')
+            stripCode(text).eachLine { line, no ->
+                def trimmed = line.trim()
+                forbidden.each { token ->
+                    if (line.contains(token)) { hits << "${f.name}:${no}: ${trimmed}  [${token}]" }
+                }
+            }
+            text.eachLine { line, no ->
+                def trimmed = line.trim()
+                def (ok, urlToken) = exempt(f, line)
+                if (!ok && urlToken != null) {
+                    hits << "${f.name}:${no}: ${trimmed}  [${urlToken} 未在豁免清单内]"
+                }
+            }
+        }
+        if (!hits.isEmpty()) {
+            throw new GradleException("pipeline 模块禁止联网 API：\n" + hits.join('\n'))
+        }
+        logger.lifecycle('assertNoNetworkApis: PASS �?pipeline 源码无联�?API'
+                + (exemptionsUsed.isEmpty() ? '' : "（具名豁�?${exemptionsUsed.unique().size()} 条："
+                   + exemptionsUsed.unique().join('; ') + "�"))
+    }
+}
+
+def thirdPartyWhitelist = [
+        'org.apache.pdfbox:pdfbox:3.0.8'    : [license: 'Apache-2.0', purpose: 'PDF 底层读写 + Type0/CIDFontType2 字体子集嵌入与 ToUnicode', licenseInJar: 'META-INF/LICENSE'],
+        'org.apache.pdfbox:pdfbox-io:3.0.8' : [license: 'Apache-2.0', purpose: 'PDFBox 的 IO 子模块（PDFBox 声明的传递）', licenseInJar: 'META-INF/LICENSE'],
+        'org.apache.pdfbox:fontbox:3.0.8'   : [license: 'Apache-2.0', purpose: 'TrueType 解析：读 cmap/glyf 做子集（PDFBox 声明的传递）', licenseInJar: 'META-INF/LICENSE'],
+        'commons-logging:commons-logging:1.4.0': [license: 'Apache-2.0', purpose: 'PDFBox 的静态初始化直接调用 LogFactory（PDFBox 声明的传递）', licenseInJar: 'META-INF/LICENSE.txt'],
+        'org.jfree:jfreechart:1.5.6'        : [license: 'LGPL-2.1',   purpose: '图表生成（C1/C3/C15 等图型）；随包许可与可重新链接义务见 docs/roadmap.md §1.9',
+                                                licenseText: 'docs/verification/licenses/LGPL-2.1.txt'],
+]
+def wlCoordinates = thirdPartyWhitelist.keySet().collect { it.toString().split(':').take(2).join(':') }.sort() as Set
+def wlVersionOf = { String coord ->
+    def vs = thirdPartyWhitelist.findAll { k, v -> k.toString().split(':').take(2).join(':') == coord }
+            .collect { k, v ->
+                def segs = k.toString().split(':')
+                if (segs.length >= 3) return segs[2]
+                return (v.version != null && !v.version.toString().trim().isEmpty()) ? v.version.toString() : null
+            }.unique()
+    if (vs.isEmpty()) return null
+    return (vs.size() == 1) ? vs[0] : (vs as Set)
+}
+tasks.register('assertNoThirdPartyRuntimeDeps') {
+    group = 'verification'
+
+    outputs.upToDateWhen { false }
+    doLast {
+        def cfg = configurations.findByName('runtimeClasspath')
+        def all = cfg == null ? [] : cfg.allDependencies.toList()
+        def sibling = all.findAll { it instanceof org.gradle.api.artifacts.ProjectDependency }
+        def ext = all.findAll {
+            it.group != null && !(it instanceof org.gradle.api.artifacts.ProjectDependency)
+        }
+
+        def resolved = cfg == null ? [] : cfg.resolvedConfiguration.resolvedArtifacts.toList()
+
+        def injected = findProperty('octant.guard.injectUnauditedDep')?.toString() == 'true'
+        def candidates = ext.collect { "${it.group}:${it.name}".toString() }
+        if (injected) {
+            candidates << 'com.google.guava:guava'
+            logger.lifecycle('!! 负向对照已启用：注入白名单外坐标 com.google.guava:guava ⇒ 本任务应当失败')
+        }
+
+        def violations = candidates.findAll { !wlCoordinates.contains(it) }
+        if (!violations.isEmpty()) {
+            throw new GradleException(
+                    "守卫失败：出现**未授权**的第三方运行时依赖（本守卫是白名单式，只放行经审计的 PDF/图表库）：\n  "
+                            + violations.collect { "  ${it}" }.join('\n')
+                            + '\n若确需引入，必须：① 在本文件 thirdPartyWhitelist 登记（坐标 + **版本** + license + 用途）；'
+                            + '② 同步 docs/design/platform-matrix.md 的白名单表（单源）；'
+                            + '③ 给出"它能失败"的反向对照（BUILD-NOTES §17）。')
+        }
+
+        def versionOverride = project.findProperty('octant.guard.whitelistVersionOverride')?.toString()
+        def declaredOverrides = [:]
+        if (versionOverride != null && !versionOverride.trim().isEmpty()) {
+            versionOverride.split(';').each { pair ->
+                def kv = pair.split('=', 2)
+                if (kv.length == 2) declaredOverrides[kv[0].trim()] = kv[1].trim()
+            }
+            if (declaredOverrides.isEmpty()) {
+                throw new GradleException("无法判定：-Poctant.guard.whitelistVersionOverride='${versionOverride}' 解析为空" +
+                        '（期望 coord=version[;coord=version]）')
+            }
+            logger.lifecycle("!! 逐坐标反向对照已启用：把声明版本覆盖为 ${declaredOverrides} ⇒ 与解析版本不同者应当失败")
+        }
+        def declaredVersionOf = { String coord ->
+            declaredOverrides.containsKey(coord) ? declaredOverrides[coord] : wlVersionOf(coord)
+        }
+        def versionProblems = []
+        def versionAudit = []
+        resolved.each { art ->
+            def coord = "${art.moduleVersion.id.group}:${art.moduleVersion.id.name}".toString()
+            if (coord == 'com.octant:common') return
+            def declared = declaredVersionOf(coord)
+            def actual = art.moduleVersion.id.version.toString()
+            versionAudit << [coord: coord, declared: declared, actual: actual]
+            if (declared == null) {
+                versionProblems << "${coord}: 白名单条目**未声明版本**（解析到 ${actual}）" +
+                        ' ⇒ 无法区分"已审计的制品"与"同名的另一个制品"。' +
+                        " 修法：把键写成 '${coord}:${actual}'（或加 version 字段并附该范围内证据）。"
+            } else if (declared instanceof Set) {
+                versionProblems << "${coord}: 白名单里对同一坐标声明了**多个版本** ${declared} ⇒ 版本锚点有歧义（应恰一条）。"
+            } else if (declared != actual) {
+                versionProblems << "${coord}: 白名单声明 ${declared}，但**解析到 ${actual}**" +
+                        ' ⇒ 实际打进包里的字节**不是**被审计的那个制品。'
+            }
+        }
+        if (!versionProblems.isEmpty()) {
+            throw new GradleException("守卫失败：第三方白名单**版本锚点**不成立（HC-2：只放行经审计的**具体制品**）：\n  "
+                    + versionProblems.collect { "  ${it}" }.join('\n  '))
+        }
+        logger.lifecycle("    版本锚点：${versionAudit.size()}/${versionAudit.size()} 件外部制品的**声明版本 == 解析版本**")
+        versionAudit.sort { it.coord }.each { r ->
+            logger.lifecycle("      · ${r.coord}  声明 ${r.declared}  解析 ${r.actual}  OK")
+        }
+
+        def unlistedTransitive = resolved.collect { "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}".toString() }
+                .findAll { it != 'com.octant:common' }
+                .unique()
+                .findAll { !wlCoordinates.contains(it) }
+        if (!unlistedTransitive.isEmpty()) {
+            throw new GradleException('守卫失败：以下**已解析**的传递依赖未登记在白名单里：'
+                    + unlistedTransitive.join(', '))
+        }
+
+        def licenseGaps = thirdPartyWhitelist.findAll { coord, meta ->
+            def hasInJar = meta.licenseInJar != null && !meta.licenseInJar.toString().isEmpty()
+            def textPath = meta.licenseText
+            def hasTextFile = textPath != null && rootProject.file(textPath.toString()).isFile()
+            return !hasInJar && !hasTextFile
+        }
+        if (!licenseGaps.isEmpty()) {
+            throw new GradleException('守卫失败：以下白名单项既未声�?许可文本�?jar �?，也没有存在的仓库内许可文本路径'
+                    + '（HC-2 �?要求许可文本随包附送）�?' + licenseGaps.keySet().join(', '))
+        }
+        logger.lifecycle("    许可文本�?{thirdPartyWhitelist.count { it.value.licenseText != null }} 项用仓库内文本�"
+
+                + "${thirdPartyWhitelist.count { it.value.licenseInJar != null }} 项随依赖 jar 自带")
+
+        logger.lifecycle("assertNoThirdPartyRuntimeDeps: PASS �?外部依赖 ${ext.size()} 条全部在白名单内"
+                + "（白名单 ${thirdPartyWhitelist.size()} 条；解析�?${resolved.size()} 个制品）"
+                + (sibling.isEmpty() ? '' : "；兄弟工程依�?${sibling.collect { it.dependencyProject.path }} 不计入第三方"))
+        def wlEntryOf = { String coord ->
+            def hit = thirdPartyWhitelist.find { k, v -> k.toString().split(':').take(2).join(':') == coord }
+            return (hit == null) ? null : hit.value
+        }
+        logger.lifecycle('    构成自证（坐标 + 版本 + 许可证 + 证据来源）：')
+        resolved.findAll { "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}" != 'com.octant:common' }
+                .sort { "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}" }
+                .each { art ->
+                    def coord = "${art.moduleVersion.id.group}:${art.moduleVersion.id.name}".toString()
+                    def meta = wlEntryOf(coord)
+                    def declaredVer = wlVersionOf(coord)
+                    def lic = (meta?.license != null) ? meta.license : '（白名单未登记许可证）'
+                    def ev = (meta?.licenseInJar != null) ? "jar:${meta.licenseInJar}"
+                            : ((meta?.licenseText != null) ? "repo:${meta.licenseText}" : '（无许可文本证据）')
+                    logger.lifecycle(String.format('      · %-42s 声明=%-8s 解析=%-8s %-12s %s',
+                            coord, declaredVer == null ? '（缺）' : declaredVer.toString(),
+                            art.moduleVersion.id.version.toString(), lic, ev))
+                }
+        logger.lifecycle("    件数：外部制品 ${resolved.count { "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}" != 'com.octant:common' }} 件；" +
+                "白名单条目 ${thirdPartyWhitelist.size()} 条（坐标 ${wlCoordinates.size()} 个）；" +
+                "许可文本：${thirdPartyWhitelist.count { it.value.licenseText != null }} 条用仓库内文本 / " +
+                "${thirdPartyWhitelist.count { it.value.licenseInJar != null }} 条随依赖 jar 自带")
+    }
+}
+
+tasks.named('check') {
+    dependsOn 'assertNoMinecraftRefs', 'assertNoNetworkApis', 'assertNoThirdPartyRuntimeDeps'
+}
+def specVersionFile = rootProject.file('docs/privacy/SPEC-VERSION.txt')
+def specVersionValue = specVersionFile.exists()
+        ? specVersionFile.getText('UTF-8').trim()
+        : ''
+if (specVersionValue.isEmpty()) {
+    logger.lifecycle(':pipeline 警告：未找到 docs/privacy/SPEC-VERSION.txt�'
+
+            + '运行时将回退到源码内的兜底版本常量（规范漂移风险�?EX-11 兜底发现�')
+} else {
+    logger.lifecycle(":pipeline 隐私规范版本（来�?docs/privacy/SPEC-VERSION.txt）：${specVersionValue}")
+}
+
+test {
+    inputs.file(specVersionFile).optional()
+        .withPropertyName('privacySpecVersionFile')
+        .withPathSensitivity(PathSensitivity.NONE)
+
+    dependsOn 'assertNoMinecraftRefs', 'assertNoNetworkApis'
+
+    systemProperty 'java.awt.headless', 'true'
+    systemProperty 'octant.e2e.out', layout.buildDirectory.dir('e2e-out').get().asFile.absolutePath
+    systemProperty 'octant.privacy.specVersion', specVersionValue
+    systemProperty 'octant.privacy.specVersionFile', specVersionFile.absolutePath
+
+    def samplesOut = findProperty('octant.samples.out')
+    if (samplesOut != null && !samplesOut.toString().isEmpty()) {
+        systemProperty 'octant.samples.out',
+                rootProject.file(samplesOut.toString()).absolutePath
+    }
+}
